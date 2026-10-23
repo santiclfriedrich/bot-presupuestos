@@ -1,0 +1,36 @@
+# top secret
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+*.pdf
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# Logs y artefactos del bot
+logs/
+*.log
+
+# Claude Code
+.claude/settings.local.json
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Backups locales de git (no subir)
+.git.backup/
