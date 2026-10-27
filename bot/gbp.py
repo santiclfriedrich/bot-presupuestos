@@ -262,12 +262,13 @@ class GBPSession:
 
         frame_menu.evaluate(r"""
         (objetivo) => {
-            objetivo = objetivo.trim().toLowerCase();
+            // GBP mete dobles espacios en varios nodos → normalizar
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            objetivo = norm(objetivo);
             const candidatos = document.querySelectorAll('a[id^="TreeView1t"]');
             let el = null;
             for (const a of candidatos) {
-                const txt = (a.innerText || a.textContent || '').trim().toLowerCase();
-                if (txt === objetivo) { el = a; break; }
+                if (norm(a.innerText || a.textContent) === objetivo) { el = a; break; }
             }
             if (!el) {
                 const disponibles = Array.from(candidatos)
