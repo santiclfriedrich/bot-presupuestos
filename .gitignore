@@ -34,3 +34,6 @@ desktop.ini
 
 # Backups locales de git (no subir)
 .git.backup/
+
+# Datos de prueba / planillas
+*.xlsx

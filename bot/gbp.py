@@ -10,6 +10,7 @@ Reglas del ERP que esto respeta:
 - Los nodos del menú (TreeView) se activan por JS buscándolos por texto.
 """
 import logging
+from datetime import datetime
 
 from playwright.sync_api import (
     Browser,
@@ -20,7 +21,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from bot.config import Config
+from bot.config import ROOT, Config
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,23 @@ def _aceptar_dialogo(dialog) -> None:
     """Acepta cualquier alert/confirm/prompt del navegador (si no, bloquean)."""
     log.info("Diálogo detectado: '%s' — aceptando.", dialog.message)
     dialog.accept()
+
+
+_PALABRAS_GUARDAR = ("guardar", "grabar", "emitir", "confirma")
+
+
+def _dialogo_sin_guardar(dialog) -> None:
+    """Como _aceptar_dialogo, pero RECHAZA los confirm que pidan guardar/emitir.
+
+    Se usa en las ventanas de carga mientras el flujo no esté validado: así un
+    "¿desea guardar los cambios?" al salir nunca termina guardando un pedido.
+    """
+    msg = dialog.message.lower()
+    if dialog.type == "confirm" and any(p in msg for p in _PALABRAS_GUARDAR) and "sin guardar" not in msg:
+        log.warning("Diálogo '%s' — RECHAZADO (modo sin guardar).", dialog.message)
+        dialog.dismiss()
+    else:
+        _aceptar_dialogo(dialog)
 
 
 def es_error_frame_perdido(e: Exception) -> bool:
@@ -114,14 +132,17 @@ class GBPSession:
             frame = gbp.frame_trabajo()
     """
 
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, permitir_guardar: bool = False) -> None:
         self._cfg = cfg
+        # False: las ventanas de carga rechazan cualquier confirm de guardar/emitir
+        self._handler_ventanas = _aceptar_dialogo if permitir_guardar else _dialogo_sin_guardar
         self._timeout_ms = cfg.gbp_timeout * 1000
 
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None  # popup del ERP (donde vive la sesión)
+        self._ventanas: list[Page] = []  # ventanas abiertas desde el escritorio
 
     def __enter__(self) -> "GBPSession":
         try:
@@ -190,9 +211,22 @@ class GBPSession:
         try:
             popup.wait_for_url("**/wfmMain**", timeout=self._timeout_ms)
         except Exception as e:
+            captura = ROOT / "logs" / f"login_fallido_{datetime.now():%Y%m%d_%H%M%S}.png"
+            texto = ""
+            try:
+                captura.parent.mkdir(exist_ok=True)
+                # Nunca dejar la clave en una captura (la pantalla nueva puede mostrarla)
+                popup.evaluate("""() => document.querySelectorAll('input').forEach(i => {
+                    if (i.type === 'password' || /pass|clave|contrase/i.test(i.id + i.name)) i.value = '';
+                })""")
+                popup.screenshot(path=str(captura), full_page=True)
+                texto = " ".join(popup.inner_text("body").split())[:300]
+            except Exception:
+                pass
             raise RuntimeError(
-                "El login no llegó a wfmMain. ¿Expiró la contraseña de GBP? "
-                "Revisá ERP_PASSWORD en el .env."
+                "El login no llegó a wfmMain. ¿La cuenta está logueada en otro lado "
+                "o expiró la contraseña (ERP_PASSWORD)? "
+                f"GBP muestra: '{texto}'. Captura: {captura}"
             ) from e
         log.info("Login exitoso.")
 
@@ -201,8 +235,21 @@ class GBPSession:
         if cfg.gbp_sucursal:
             _seleccionar_sucursal(popup, cfg.gbp_sucursal, self._timeout_ms)
 
+    def asegurar_sucursal(self, sucursal_value: str) -> None:
+        """Deja activa la sucursal (value de #ddlBranch). Llamar sin ventanas abiertas."""
+        assert self.page is not None, "Llamar a conectar() primero."
+        _seleccionar_sucursal(self.page, sucursal_value, self._timeout_ms)
+
+    def cerrar_ventanas(self) -> None:
+        """Cierra con "Salir" todas las ventanas abiertas desde el menú/escritorio."""
+        for ventana in self._ventanas:
+            self.cerrar_con_salir(ventana)
+        self._ventanas = []
+
     def desconectar(self) -> None:
         """Logout (#lnkLogout) y cierre del navegador. SIEMPRE llamarlo, incluso ante error."""
+        self.cerrar_ventanas()
+
         if self.page is not None:
             try:
                 for frame in [self.page] + self.page.frames:
@@ -234,6 +281,79 @@ class GBPSession:
         self.context = None
         self._pw = None
 
+    @staticmethod
+    def cerrar_msgbox(ventana: Page) -> str | None:
+        """Si hay un cartel propio de GBP abierto (WucMsgBox, no es un diálogo del
+        navegador), lee su texto, toca "Ok" y devuelve el texto. None si no hay.
+
+        Ej.: "El cliente está siendo usado por: <usuario>". Tapan toda la ventana,
+        así que hay que cerrarlos antes de cualquier otro click.
+        """
+        for frame in ventana.frames:
+            try:
+                ok = frame.locator('a[id$="_wucMB_btnOk_LB"]')
+                for i in range(ok.count()):
+                    boton = ok.nth(i)
+                    if not boton.is_visible():
+                        continue
+                    texto = boton.evaluate("""el => {
+                        let p = el;
+                        for (let i = 0; i < 10 && p; i++) {
+                            p = p.parentElement;
+                            const t = (p && p.innerText || '').replace(/\\s+/g, ' ').trim();
+                            if (t.length > 4) return t.replace(/\\s*Ok$/, '');
+                        }
+                        return '';
+                    }""")
+                    log.warning("Cartel de GBP: '%s' — toco Ok.", texto)
+                    boton.click(timeout=5000)
+                    ventana.wait_for_timeout(1500)
+                    return texto
+            except Exception as e:
+                log.debug("Buscando cartel de GBP en %s: %s", frame.url, e)
+        return None
+
+    @classmethod
+    def cerrar_con_salir(cls, ventana: Page) -> None:
+        """Cierra una ventana de GBP con su botón "Salir", nunca con la X.
+
+        Cerrarla "por afuera" (ventana.close()) puede bloquear el ERP ~5 min.
+        Sólo si el botón no aparece se cae a close() como último recurso.
+        """
+        if ventana.is_closed():
+            return
+        cls.cerrar_msgbox(ventana)
+        # Un modal abierto (p. ej. "Actualización de Ítems", que es un iframe
+        # wfmSaleOrderDetail.aspx) tapa el botón Salir: cancelarlo primero.
+        for frame in ventana.frames[1:]:
+            try:
+                cancelar = frame.locator("#wucIB_Cancel_LB")
+                if cancelar.count() > 0 and cancelar.first.is_visible():
+                    cancelar.first.click(timeout=5000)
+                    ventana.wait_for_timeout(2000)
+                    log.info("Modal abierto cancelado antes de Salir (%s).", frame.url)
+            except Exception as e:
+                log.warning("No pude cancelar el modal abierto: %s", e)
+        for sel in ("#wucIB_Exit_LB", "#wucIB_Exit_pnlC", "#wucIB_Exit_SP", "text=Salir"):
+            try:
+                boton = ventana.locator(sel)
+                if boton.count() == 0:
+                    continue
+                boton.first.click(timeout=5000)
+                try:
+                    ventana.wait_for_event("close", timeout=10000)
+                except Exception:
+                    log.warning('Click en "Salir" no cerró la ventana en 10s.')
+                log.info('Ventana cerrada con "Salir" (%s).', sel)
+                return
+            except Exception as e:
+                log.debug('Selector "%s" para Salir falló: %s', sel, e)
+        log.warning('No encontré "Salir"; cierro por afuera (puede bloquear el ERP ~5 min).')
+        try:
+            ventana.close()
+        except Exception:
+            pass
+
     # -- Navegación -----------------------------------------------------
 
     def frame_trabajo(self) -> Frame:
@@ -243,6 +363,73 @@ class GBPSession:
         if frame is None:
             raise RuntimeError("Se perdió frameWorkingArea.")
         return frame
+
+    def abrir_desde_menu(self, texto_nodo: str) -> Page | Frame:
+        """Abre una pantalla del menú lateral buscando el nodo por texto exacto.
+
+        En la interfaz nueva los nodos traen la URL en `data-href` y el destino en
+        `data-target` (el `href` viene vacío, y el nodo puede estar plegado, así
+        que no se puede clickear). Se abre la URL igual que lo haría GBP: en una
+        ventana nueva si el destino es _blank, o en frameWorkingArea si no.
+        Devuelve el popup o el frame.
+        """
+        assert self.page is not None and self.context is not None, "Llamar a conectar() primero."
+        frame_menu = self.page.frame("frameMenu")
+        if frame_menu is None:
+            raise RuntimeError("No se encontró frameMenu.")
+        frame_menu.wait_for_load_state("domcontentloaded", timeout=self._timeout_ms)
+
+        nodo = frame_menu.evaluate(r"""
+        (objetivo) => {
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const el = Array.from(document.querySelectorAll('a[id^="TreeView1t"]'))
+                .find(a => norm(a.innerText || a.textContent) === norm(objetivo));
+            if (!el) return null;
+            return {
+                id: el.id,
+                url: el.getAttribute('data-href') || el.getAttribute('href') || '',
+                target: el.getAttribute('data-target') || el.getAttribute('target') || '',
+            };
+        }
+        """, texto_nodo)
+        if not nodo or not nodo["url"] or nodo["url"].startswith("javascript"):
+            raise RuntimeError(f"No encontré el nodo '{texto_nodo}' (con URL) en el menú: {nodo}")
+        log.info("Abriendo '%s' desde el menú (%s, target=%s)...", texto_nodo, nodo["id"], nodo["target"])
+
+        if nodo["target"] == "_blank":
+            # Las URLs .htm son lanzadores: abren la ventana real (.aspx) y se
+            # cierran solas. Esperamos la que queda abierta con una .aspx.
+            nuevas: list[Page] = []
+
+            def _registrar(pg: Page) -> None:
+                pg.on("dialog", self._handler_ventanas)
+                nuevas.append(pg)
+
+            self.context.on("page", _registrar)
+            frame_menu.evaluate("(url) => window.open(url, '_blank')", nodo["url"])
+            for _ in range(self._cfg.gbp_timeout):
+                self.page.wait_for_timeout(1000)
+                abiertas = [pg for pg in nuevas if not pg.is_closed() and ".aspx" in (pg.url or "")]
+                if abiertas:
+                    popup = abiertas[-1]
+                    self._ventanas.append(popup)
+                    popup.wait_for_load_state("domcontentloaded", timeout=self._timeout_ms)
+                    log.info("Se abrió una ventana nueva: %s", popup.url)
+                    return popup
+            raise RuntimeError(
+                f"'{texto_nodo}' no abrió ninguna ventana .aspx. Vistas: {[pg.url for pg in nuevas]}")
+
+        url_antes = self.frame_trabajo().url
+        frame_menu.evaluate(
+            "(url) => { window.parent.frames['frameWorkingArea'].location.href = url; }", nodo["url"])
+        for _ in range(15):
+            self.page.wait_for_timeout(1000)
+            frame = self.frame_trabajo()
+            if frame.url != url_antes:
+                frame.wait_for_load_state("domcontentloaded", timeout=self._timeout_ms)
+                log.info("frameWorkingArea: %s", frame.url)
+                return frame
+        raise RuntimeError(f"El nodo '{texto_nodo}' no abrió ninguna pantalla.")
 
     def navegar_a(self, texto_nodo: str, url_contiene: str | None = None) -> Frame:
         """Activa un nodo del menú lateral (TreeView) buscándolo por texto.

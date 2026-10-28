@@ -1,6 +1,7 @@
 """Lee la configuración del .env (en la raíz del repo)."""
 import os
 from dataclasses import dataclass
+from datetime import datetime, time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,10 +29,21 @@ class Config:
     gbp_timeout: int
     poll_interval: int
     headless: bool
+    dry_run: bool        # True: carga todo, saca captura y NO guarda
+    hora_inicio: time    # fuera de este horario no se toman jobs
+    hora_fin: time
+
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+
+
+def _hora(name: str, default: str) -> time:
+    return datetime.strptime(os.getenv(name, default).strip(), "%H:%M").time()
 
 
 def load_config(require_gbp: bool = True) -> Config:
-    """require_gbp=False permite correr sólo el polling (FASE 0) sin credenciales de GBP."""
+    """require_gbp=False permite correr sólo el polling sin credenciales de GBP."""
     get_gbp = _required if require_gbp else (lambda n: os.getenv(n, "").strip())
     return Config(
         crm_base_url=_required("CRM_BASE_URL").rstrip("/"),
@@ -43,5 +55,8 @@ def load_config(require_gbp: bool = True) -> Config:
         gbp_sucursal=os.getenv("GBP_SUCURSAL", "").strip(),
         gbp_timeout=int(os.getenv("GBP_TIMEOUT_SECONDS", "30")),
         poll_interval=int(os.getenv("POLL_INTERVAL_SECONDS", "20")),
-        headless=os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes"),
+        headless=_flag("HEADLESS", "false"),
+        dry_run=_flag("DRY_RUN", "true"),
+        hora_inicio=_hora("HORA_INICIO", "08:00"),
+        hora_fin=_hora("HORA_FIN", "19:00"),
     )
