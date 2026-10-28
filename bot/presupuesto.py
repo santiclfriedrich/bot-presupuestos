@@ -145,10 +145,18 @@ class CargadorPresupuesto:
         return modal
 
     def _seleccionar_por_texto(self, selector: str, texto: str, contexto: str) -> None:
+        """Elige la opción por texto. Si no está exacta, acepta la misma con prefijo de
+        sucursal (en SKOP los documentos se llaman "05.Presupuesto U$D")."""
         sel = self.v.locator(selector)
         opciones = sel.evaluate("el => Array.from(el.options).map(o => o.text.trim())")
         if texto not in opciones:
-            raise ErrorCarga(f"{contexto}: no existe la opción '{texto}' en GBP. Opciones: {opciones}")
+            candidatas = [o for o in opciones if re.sub(r"^\d+\.\s*", "", o) == texto]
+            if len(candidatas) != 1:
+                raise ErrorCarga(f"{contexto}: no existe la opción '{texto}' en GBP"
+                                 f"{' (ambigua: ' + str(candidatas) + ')' if candidatas else ''}. "
+                                 f"Opciones: {opciones}")
+            log.info("%s: '%s' → '%s'", contexto, texto, candidatas[0])
+            texto = candidatas[0]
         sel.select_option(label=texto)
         self._esperar(3000)  # onchange → __doPostBack
         self._chequear_cartel(contexto)
